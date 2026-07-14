@@ -1,0 +1,87 @@
+name: Seat Check
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test notification instead of checking seats"
+        type: boolean
+        default: false
+
+concurrency:
+  group: seat-check
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  check:
+    # Kill switch: set the MONITOR_ENABLED repo variable to "true" to run this,
+    # anything else (including unset) skips the job entirely.
+    if: ${{ vars.MONITOR_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Send test notification
+        if: ${{ github.event.inputs.test == 'true' }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python check_seats.py test-notify
+
+      # GitHub's cron floor is 5 minutes and firing can jitter by several more,
+      # so this loops the real check every 60s for ~4.5 minutes to get
+      # effective ~1/minute coverage out of a single scheduled run.
+      - name: Run seat checks (~1/min for ~4.5 min)
+        if: ${{ github.event.inputs.test != 'true' }}
+        id: checks
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CLASS_NUMBER: ${{ vars.CLASS_NUMBER }}
+          TERM_CODE: ${{ vars.TERM_CODE }}
+        run: |
+          set +e
+          fails=0
+          total=0
+          end=$((SECONDS + 270))
+          while [ "$SECONDS" -lt "$end" ]; do
+            total=$((total + 1))
+            python check_seats.py check
+            [ $? -ne 0 ] && fails=$((fails + 1))
+            remaining=$((end - SECONDS))
+            [ "$remaining" -gt 60 ] && sleep 60 || break
+          done
+          echo "ran $total checks, $fails failed"
+          if [ "$total" -gt 0 ] && [ "$fails" -lt "$total" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Only fail the whole run if every single check this run failed --
+          # that's what "the monitor is broken" should mean, not one flaky call.
+          [ "$fails" -eq "$total" ] && [ "$total" -gt 0 ] && exit 1
+          exit 0
+
+      # Derives consecutive-failure / recovery state from this workflow's own
+      # run history via the GitHub API instead of a hand-rolled state file.
+      - name: Evaluate monitor health
+        if: ${{ always() && github.event.inputs.test != 'true' }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python check_seats.py monitor-health --current-run-ok "${{ steps.checks.outputs.ok || 'false' }}"

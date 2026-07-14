@@ -1,0 +1,57 @@
+name: Weekly Heartbeat
+
+# Cron runs in UTC and GitHub does not adjust it for US Daylight Saving Time.
+# 14:00 UTC = 9:00 AM Central during CDT (UTC-5, roughly mid-Mar to early Nov).
+# During CST (UTC-6, winter) this fires at 8:00 AM Central instead.
+on:
+  schedule:
+    - cron: "0 14 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: weekly-heartbeat
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Send weekly heartbeat
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CLASS_NUMBER: ${{ vars.CLASS_NUMBER }}
+          TERM_CODE: ${{ vars.TERM_CODE }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python check_seats.py weekly-heartbeat
+
+      # GitHub auto-disables scheduled workflows after 60 days with no repo
+      # activity. This weekly commit keeps the repo "active" so seat-check's
+      # every-5-minutes schedule (and this heartbeat) never gets silently
+      # switched off.
+      - name: Keepalive commit
+        if: always()
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/.keepalive
+          git config user.name "seat-monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add .github/.keepalive
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: keepalive $(date -u +%Y-%m-%d)"
+            git push
+          fi
